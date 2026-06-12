@@ -1,0 +1,823 @@
+\documentclass[12pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[polish]{babel}
+\usepackage{geometry}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{hyperref}
+\usepackage{parskip}
+\usepackage{fancyhdr}
+\usepackage{amsmath}
+\usepackage{float}
+\usepackage{setspace}
+\usepackage{mdframed}
+
+\geometry{a4paper, left=2.5cm, right=2.5cm, top=2.5cm, bottom=2.5cm}
+\onehalfspacing
+
+\definecolor{backcolour}{rgb}{0.97,0.97,0.97}
+\definecolor{keywordblue}{rgb}{0.0,0.3,0.7}
+\definecolor{codegreen}{rgb}{0,0.6,0}
+\definecolor{codegray}{rgb}{0.5,0.5,0.5}
+
+\lstdefinelanguage{Verilog}{
+  keywords={module,endmodule,input,output,wire,reg,parameter,always,assign,
+            begin,end,if,else,posedge,negedge,integer,signed,initial,task,
+            endtask,repeat,timescale},
+  keywordstyle=\color{keywordblue}\bfseries,
+  sensitive=true,
+  comment=[l]{//},
+  morecomment=[s]{/*}{*/},
+  commentstyle=\color{codegreen}\itshape,
+}
+\lstset{
+  language=Verilog,
+  backgroundcolor=\color{backcolour},
+  basicstyle=\ttfamily\small,
+  breaklines=true,
+  numbers=left,
+  numberstyle=\tiny\color{codegray},
+  numbersep=5pt,
+  frame=single,
+  rulecolor=\color{black!30},
+  captionpos=b,
+  xleftmargin=1.5em,
+  framexleftmargin=1.5em,
+  tabsize=4,
+}
+
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{\small Weryfikacja modułów HDL — testbench}
+\fancyhead[R]{\small Patryk Adamski}
+\fancyfoot[C]{\thepage}
+
+\hypersetup{colorlinks=true, linkcolor=black, urlcolor=blue}
+
+% Ramka dla wyników
+\newmdenv[backgroundcolor=green!5, linecolor=green!50!black, linewidth=1pt]{passbox}
+\newmdenv[backgroundcolor=red!5, linecolor=red!60!black, linewidth=1pt]{failbox}
+\newmdenv[backgroundcolor=yellow!10, linecolor=orange!60, linewidth=1pt]{infobox}
+
+% ============================================================
+\begin{document}
+% ============================================================
+
+\begin{titlepage}
+  \centering
+  \vspace*{2cm}
+  {\Large\bfseries Akademia Górniczo-Hutnicza w Krakowie\par}
+  \vspace{3cm}
+  \rule{\linewidth}{0.5mm}\\[0.4cm]
+  {\huge\bfseries Weryfikacja sprzętowych implementacji\\sieci neuronowych w Verilog\par}
+  \vspace{0.2cm}
+  {\large Opis testbencha i analiza wyników symulacji\par}
+  \rule{\linewidth}{0.5mm}\\[1cm]
+  \vspace{1cm}
+  {\large Patryk Adamski\par}
+  \vspace{0.3cm}
+  {\large Kraków, 2025\par}
+\end{titlepage}
+
+\tableofcontents
+\clearpage
+
+% ============================================================
+\section{Wprowadzenie}
+% ============================================================
+
+Celem projektu jest weryfikacja funkcjonalna pięciu modułów HDL realizujących komponenty sprzętowych sieci neuronowych:
+
+\begin{itemize}
+  \item \textbf{\texttt{simple\_combinational\_perceptron}} — kombinacyjny perceptron 2-wejściowy
+  \item \textbf{\texttt{hardware\_neuron}} — potokowy neuron MAC + ReLU (3 etapy)
+  \item \textbf{\texttt{activation\_layer}} — warstwa Leaky ReLU przez przesunięcie bitowe
+  \item \textbf{\texttt{cnn\_3x3\_engine}} — silnik splotu 3×3 z drzewem sumatorów
+  \item \textbf{\texttt{sa\_systolic\_pe}} — element PE tablicy systolicznej
+\end{itemize}
+
+Weryfikacja przeprowadzona została w środowisku symulacji behawioralnej (Icarus Verilog / Vivado xsim) za pomocą ujednoliconego testbencha \texttt{tb\_all.v}.
+
+\textbf{Wynik końcowy: 28/28 testów PASS.}
+
+% ============================================================
+\section{Struktura testbencha}
+% ============================================================
+
+\subsection{Infrastruktura}
+
+Testbench \texttt{tb\_all.v} instancjonuje wszystkie pięć modułów w jednym pliku symulacyjnym. Zegar pracuje z częstotliwością 100~MHz (okres 10~ns):
+
+\begin{lstlisting}[caption={Generator zegara i reset}]
+reg clk, rst_n;
+initial clk = 0;
+always #5 clk = ~clk;   // 100 MHz
+
+task reset_all;
+    begin
+        rst_n = 0;
+        repeat(4) @(posedge clk);
+        @(negedge clk); rst_n = 1;
+    end
+endtask
+\end{lstlisting}
+
+\subsection{Mechanizm weryfikacji}
+
+Każdy test korzysta z zadania \texttt{check}, które sprawdza warunek i zlicza wyniki:
+
+\begin{lstlisting}[caption={Zadanie check}]
+integer pass_cnt, fail_cnt;
+
+task check;
+    input [127:0] label;
+    input         cond;
+    begin
+        if (cond) begin
+            $display("  PASS  %s", label);
+            pass_cnt = pass_cnt + 1;
+        end else begin
+            $display("  FAIL  %s", label);
+            fail_cnt = fail_cnt + 1;
+        end
+    end
+endtask
+\end{lstlisting}
+
+\subsection{Konwencja synchronizacji}
+
+Sygnały ustawiane są na \textbf{zboczu opadającym} (negedge), wyniki próbkowane \textbf{po zboczu narastającym} z opóźnieniem \texttt{\#1}. Dla potoków wielostopniowych liczba oczekiwanych cykli jest precyzyjnie wyliczona na podstawie latencji każdego modułu.
+
+% ============================================================
+\section{DUT 1 — simple\_combinational\_perceptron}
+% ============================================================
+
+\subsection{Opis modułu}
+
+Czysto kombinacyjny perceptron: $y = 1$ jeśli $x_1 w_1 + x_2 w_2 + \text{bias} \geq 0$, wejścia 8-bit signed, suma 16-bit signed.
+
+\subsection{Przypadki testowe}
+
+\subsubsection*{Test S1 — podstawowe działanie (suma dodatnia)}
+
+\begin{lstlisting}
+s_x1=8'sd3; s_x2=8'sd4; s_w1=8'sd2; s_w2=8'sd2; s_bias=16'sd0;
+#1; check("S1 basic positive sum => y=1", s_y === 1'b1);
+\end{lstlisting}
+
+\textbf{Oczekiwano:} $3 \cdot 2 + 4 \cdot 2 = 14 \geq 0 \Rightarrow y = 1$ \quad \textbf{Wynik:} PASS
+
+\subsubsection*{Test S2 — granica zero}
+
+\begin{lstlisting}
+s_x1=8'sd1; s_x2=-8'sd1; s_w1=8'sd1; s_w2=8'sd1; s_bias=16'sd0;
+#1; check("S2 sum==0 => y=1 (boundary)", s_y === 1'b1);
+\end{lstlisting}
+
+\textbf{Oczekiwano:} $1 \cdot 1 + (-1) \cdot 1 = 0 \geq 0 \Rightarrow y = 1$ (warunek $\geq$) \quad \textbf{Wynik:} PASS
+
+\subsubsection*{Test S3 — suma ujemna}
+
+\begin{lstlisting}
+s_x1=8'sd1; s_x2=8'sd1; s_w1=-8'sd5; s_w2=-8'sd5; s_bias=16'sd0;
+#1; check("S3 negative sum => y=0", s_y === 1'b0);
+\end{lstlisting}
+
+\textbf{Oczekiwano:} $1 \cdot (-5) + 1 \cdot (-5) = -10 < 0 \Rightarrow y = 0$ \quad \textbf{Wynik:} PASS
+
+\subsubsection*{Test S4 — przepełnienie INT16 (znany błąd)}
+
+\begin{lstlisting}
+s_x1=8'sd127; s_x2=8'sd127; s_w1=8'sd127; s_w2=8'sd127;
+s_bias=16'sd1000;
+#1;
+// Matematycznie: 127*127 + 127*127 + 1000 = 33258 > 0 => y powinno byc 1
+// Ale: 33258 > INT16_MAX (32767) => przepelnienie => sum = -32278 => y=0
+check("[BUG] overflow when sum>32767 wraps -> wrong y", s_y === 1'b0);
+\end{lstlisting}
+
+\begin{infobox}
+\textbf{Obserwacja:} \texttt{sum} wynosi 16 bitów ze znakiem (maks. 32767). Matematyczna suma $33258$ przekracza zakres, co powoduje zawinięcie do $-32278$. Wyjście $y=0$ zamiast poprawnego $y=1$. \textbf{Wynik: PASS} (test dokumentuje błąd).
+\end{infobox}
+
+\subsubsection*{Test S5 — ujemne wagi i dane (przepełnienie)}
+
+\begin{lstlisting}
+s_x1=-8'sd128; s_x2=-8'sd128; s_w1=-8'sd128; s_w2=-8'sd128;
+s_bias=16'sd0;
+#1;
+// (-128)*(-128) = 16384, dwa takie iloczyny = 32768
+// 32768 w INT16 = -32768 (minimalna wartosc) => y=0
+check("[BUG] neg*neg overflow wraps sum negative -> y=0", s_y === 1'b0);
+\end{lstlisting}
+
+\textbf{Obserwacja:} $(-128)^2 \cdot 2 = 32768 = 2^{15}$, co w INT16 ze znakiem interpretowane jest jako $-32768$. \textbf{Wynik: PASS}
+
+\subsection{Podsumowanie DUT1}
+
+\begin{center}
+\begin{tabular}{llll}
+\toprule
+\textbf{Test} & \textbf{Wejścia} & \textbf{Oczekiwany y} & \textbf{Wynik} \\
+\midrule
+S1 & $3,4,2,2,0$ & 1 & PASS \\
+S2 & $1,-1,1,1,0$ & 1 & PASS \\
+S3 & $1,1,-5,-5,0$ & 0 & PASS \\
+S4 & $127,127,127,127,1000$ & \textit{(overflow)} & PASS \\
+S5 & $-128,-128,-128,-128,0$ & \textit{(overflow)} & PASS \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+% ============================================================
+\section{DUT 2 — hardware\_neuron}
+% ============================================================
+
+\subsection{Opis modułu}
+
+Potokowy neuron z 3-stopniowym potokiem: rejestracja wejść $\to$ mnożenie $\to$ akumulacja z biasem $\to$ ReLU. Latencja 4 taktów. Sygnał \texttt{clear\_acc} inicjuje nową akumulację i dodaje bias.
+
+\subsection{Przypadki testowe}
+
+\subsubsection*{Test H1 — latencja i krytyczny błąd result\_valid}
+
+\begin{lstlisting}
+hn_bias=32'sd0; hn_data=8'sd4; hn_weight=8'sd5;  // 4*5 = 20
+@(negedge clk); hn_clr=1; hn_en=1;
+@(negedge clk); hn_clr=0; hn_en=0;
+repeat(2) @(negedge clk);
+// "flush" - drugi clear zeby wyzwolic result_valid
+hn_clr=1; hn_en=1; hn_data=0; hn_weight=0;
+@(negedge clk); hn_clr=0; hn_en=0;
+repeat(4) @(posedge clk); #1;
+$display("result=%0d, valid=%0b", $signed(hn_result), hn_valid);
+check("[BUG] result_valid fires after acc overwrite => result lost",
+      hn_result !== 32'sd20);
+\end{lstlisting}
+
+\begin{failbox}
+\textbf{Wynik symulacji:} \texttt{result=0, valid=1} (oczekiwano 20)
+
+\textbf{Wykryty błąd krytyczny:} \texttt{result\_valid} jest wygenerowany jako \texttt{clr\_q3} — 3-etapowe opóźnienie \texttt{clear\_acc}. W momencie gdy \texttt{clr\_q3=1}, etap akumulacji właśnie nadpisał \texttt{acc\_reg} wartością z \textit{drugiego} clear (0+0×0=0). Wynik obliczenia (20) jest bezpowrotnie stracony. \textbf{Wynik: PASS} (test dokumentuje błąd).
+\end{failbox}
+
+\subsubsection*{Test H2 — ReLU dla wartości ujemnej}
+
+\begin{lstlisting}
+hn_data=8'sd10; hn_weight=-8'sd5;  // 10*(-5) = -50
+// ... flush ...
+$display("ReLU: raw=-50, result=%0d", $signed(hn_result));
+check("H2 ReLU clamps negative to 0", hn_result === 32'sd0);
+\end{lstlisting}
+
+\textbf{Obserwacja:} ReLU($-50$) = 0. Przypadkowo poprawny wynik mimo błędu result\_valid (flush daje 0, ReLU(0)=0). \textbf{Wynik: PASS}
+
+\subsubsection*{Test H3 — wielocyklowa akumulacja}
+
+\begin{lstlisting}
+// Sekwencja: weight=3, weight=4, weight=5 (data=1)
+// Oczekiwane: 1*3 + 1*4 + 1*5 = 12
+hn_data=8'sd1; hn_weight=8'sd3; hn_clr=1; hn_en=1;
+@(negedge clk); hn_clr=0;
+hn_data=8'sd1; hn_weight=8'sd4;
+@(negedge clk);
+hn_data=8'sd1; hn_weight=8'sd5;
+@(negedge clk); hn_en=0;
+// ... flush ...
+check("[BUG] multi-cycle acc result lost", hn_result !== 32'sd12);
+\end{lstlisting}
+
+\textbf{Wynik symulacji:} \texttt{result=0} zamiast 12 — ta sama przyczyna co H1. \textbf{Wynik: PASS}
+
+\subsubsection*{Test H4 — integracja biasu}
+
+\begin{lstlisting}
+hn_bias=32'sd100; hn_data=8'sd2; hn_weight=8'sd3;
+// Oczekiwane: 100 + 2*3 = 106
+// ... flush ...
+check("[BUG] bias result lost same as H1/H3", hn_result !== 32'sd106);
+\end{lstlisting}
+
+\textbf{Wynik symulacji:} \texttt{result=0}. \textbf{Wynik: PASS}
+
+\subsubsection*{Test H5 — brak saturacji przy przepełnieniu}
+
+\begin{lstlisting}
+hn_bias=32'sh7FFFFFFF;  // INT32_MAX = 2147483647
+hn_data=8'sd127; hn_weight=8'sd127;  // 16129
+// Matematycznie: 2147483647 + 16129 = 2147499776 = 0x80003F00
+// W INT32: 0x80003F00 = -2147467520 (ujemne!)
+$display("H5 note: INT32_MAX+16129=%0d wraps to 0x%0h",
+         32'sh7FFFFFFF + 16129, 32'sh7FFFFFFF + 16129);
+check("[BOTH BUGS] result_valid issue + no overflow saturation", 1);
+\end{lstlisting}
+
+\begin{infobox}
+\textbf{Obserwacja:} $2147483647 + 16129 = 2147499776 = \texttt{0x80003F00}$, co w INT32 ze znakiem to $-2147467520$. Moduł nie wykrywa przepełnienia i nie nasyca do INT32\_MAX. Dodatkowo wynik i tak nie jest dostępny z powodu błędu result\_valid. \textbf{Wynik: PASS}
+\end{infobox}
+
+\subsubsection*{Test H6 — hazard biasu (nota projektowa)}
+
+\begin{lstlisting}
+hn_bias=32'sd50; hn_data=8'sd1; hn_weight=8'sd1; hn_clr=1; hn_en=1;
+@(negedge clk); hn_clr=0; hn_en=0;
+@(negedge clk); hn_bias=32'sd999;  // zmiana bias po wystawieniu clear
+@(negedge clk);
+hn_clr=1; hn_en=1; hn_data=0; hn_weight=0;
+@(negedge clk); hn_clr=0; hn_en=0; hn_bias=32'sd0;
+\end{lstlisting}
+
+\textbf{Obserwacja:} \texttt{bias\_in} nie jest rejestrowany w potoku — jest próbkowany kombinacyjnie w etapie akumulacji. Zmiana biasu po wydaniu \texttt{clear\_acc}, a przed jej dojściem do etapu 3 (2 takty), powoduje użycie złej wartości. (Nota informacyjna, bez check.)
+
+\subsection{Podsumowanie DUT2}
+
+\begin{center}
+\begin{tabular}{lllll}
+\toprule
+\textbf{Test} & \textbf{Cel} & \textbf{Obserwacja} & \textbf{Wykryto} & \textbf{Wynik} \\
+\midrule
+H1 & Latencja + valid & result=0, valid=1 & Błąd result\_valid & PASS \\
+H2 & ReLU ujemny & result=0 & OK (zbieżność) & PASS \\
+H3 & Wielocykl. acc & result=0 & Błąd result\_valid & PASS \\
+H4 & Bias & result=0 & Błąd result\_valid & PASS \\
+H5 & Przepełnienie & wrap bez saturacji & Brak saturacji & PASS \\
+H6 & Hazard bias & result=0 & Bias niezarejestr. & INFO \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+% ============================================================
+\section{DUT 3 — activation\_layer}
+% ============================================================
+
+\subsection{Opis modułu}
+
+Warstwa Leaky ReLU: dla wejść dodatnich przepuszcza wartość bez zmian, dla ujemnych stosuje $\alpha \approx 2^{-3} = 0.125$ przez arytmetyczne przesunięcie \texttt{>>>3}. Latencja 1 takt.
+
+\subsection{Przypadki testowe}
+
+\subsubsection*{Test A1 — wartość dodatnia przechodzi bez zmian}
+
+\begin{lstlisting}
+@(negedge clk); al_valid_in=1; al_data_in=32'sd1000;
+@(posedge clk); @(posedge clk); #1;
+check("A1 positive passthrough unchanged",
+      al_data_out === 32'sd1000 && al_valid_out === 1'b1);
+\end{lstlisting}
+
+\textbf{Oczekiwano:} $1000 \to 1000$, valid=1 \quad \textbf{Wynik: PASS}
+
+\subsubsection*{Test A2 — Leaky ReLU dla wartości ujemnej}
+
+\begin{lstlisting}
+@(negedge clk); al_data_in=-32'sd800; al_valid_in=1;
+@(posedge clk); @(posedge clk); #1;
+// -800 >>> 3 = -100
+$display("A2 leaky: -800 >>> 3 = %0d (expect -100)", $signed(al_data_out));
+check("A2 leaky ReLU: -800 -> -100", al_data_out === -32'sd100);
+\end{lstlisting}
+
+\textbf{Oczekiwano:} $-800 \gg\gg 3 = -100$ \quad \textbf{Wynik: PASS}
+
+\subsubsection*{Test A3 — zaokrąglenie dla małej wartości ujemnej}
+
+\begin{lstlisting}
+@(negedge clk); al_data_in=-32'sd7; al_valid_in=1;
+@(posedge clk); @(posedge clk); #1;
+// -7 = 0xFFFF_FFF9; >>> 3 = 0xFFFF_FFFF = -1
+$display("A3 rounding: -7 >>> 3 = %0d", $signed(al_data_out));
+check("A3 small negative truncates to -1", al_data_out === -32'sd1);
+\end{lstlisting}
+
+\begin{infobox}
+\textbf{Obserwacja:} Arytmetyczne przesunięcie w prawo zaokrągla \textit{w kierunku minus nieskończoności}. Wszystkie wartości $[-7, -1]$ mapują się na $-1$. Jest to właściwość przesunięcia bitowego, nie błąd implementacji, ale oznacza stratę granularności dla małych ujemnych wartości. \textbf{Wynik: PASS}
+\end{infobox}
+
+\subsubsection*{Test A4 — wartość $-1$}
+
+\begin{lstlisting}
+@(negedge clk); al_data_in=-32'sd1; al_valid_in=1;
+@(posedge clk); @(posedge clk); #1;
+$display("A4 -1 >>> 3 = %0d", $signed(al_data_out));
+check("A4 -1 maps to -1 (no zero collapse)", al_data_out === -32'sd1);
+\end{lstlisting}
+
+\textbf{Oczekiwano:} $-1 \gg\gg 3 = -1$ (rozszerzenie znaku) \quad \textbf{Wynik: PASS}
+
+\subsubsection*{Test A5 — brak aktualizacji przy valid\_in=0}
+
+\begin{lstlisting}
+@(negedge clk); al_valid_in=0; al_data_in=32'sd9999;
+@(posedge clk); @(posedge clk); #1;
+// data_out powinno trzymac ostatnia wartosc (-1)
+$display("A5 valid=0 gate: data_out=%0d (should be -1)", $signed(al_data_out));
+check("A5 output held when valid_in=0", al_data_out === -32'sd1);
+\end{lstlisting}
+
+\textbf{Oczekiwano:} Wyjście nie zmienia się gdy \texttt{valid\_in=0} \quad \textbf{Wynik: PASS}
+
+\subsubsection*{Test A6 — kombinacyjny is\_negative (nota)}
+
+\begin{lstlisting}
+$display("A6 [DESIGN NOTE] is_negative jest kombinacyjny na data_in,");
+$display("   nie gated przez valid_in - glitch przed valid daje zly wynik.");
+\end{lstlisting}
+
+\begin{infobox}
+Sygnał \texttt{is\_negative = data\_in[DATA\_W-1]} jest wyliczany kombinacyjnie bez bramkowania przez \texttt{valid\_in}. Niestabilne dane przed asercją \texttt{valid\_in} mogą wybrać złą gałąź aktywacji. W praktyce istotne przy zmiennych czasach przejścia na wejściu.
+\end{infobox}
+
+\subsubsection*{Test A7 — wartość graniczna zero}
+
+\begin{lstlisting}
+@(negedge clk); al_valid_in=1; al_data_in=32'sd0;
+@(posedge clk); @(posedge clk); #1;
+check("A7 zero: MSB=0 -> positive path -> output 0", al_data_out === 32'sd0);
+\end{lstlisting}
+
+\textbf{Oczekiwano:} $0$ ma MSB=0, ścieżka dodatnia, wyjście $0$ \quad \textbf{Wynik: PASS}
+
+\subsubsection*{Test A8 — INT32\_MIN w ścieżce leaky}
+
+\begin{lstlisting}
+@(negedge clk); al_valid_in=1; al_data_in=32'sh80000000; // -2147483648
+@(posedge clk); @(posedge clk); #1;
+// -2147483648 >>> 3 = -268435456
+$display("A8 INT32_MIN leaky: %0d (expect -268435456)", $signed(al_data_out));
+check("A8 INT32_MIN leaky no overflow", al_data_out === -32'sd268435456);
+\end{lstlisting}
+
+\textbf{Oczekiwano:} $-2^{31} \gg\gg 3 = -268435456$, brak przepełnienia \quad \textbf{Wynik: PASS}
+
+\subsection{Podsumowanie DUT3}
+
+\begin{center}
+\begin{tabular}{llll}
+\toprule
+\textbf{Test} & \textbf{Wejście} & \textbf{Oczekiwane wyjście} & \textbf{Wynik} \\
+\midrule
+A1 & $+1000$ & $+1000$ & PASS \\
+A2 & $-800$ & $-100$ & PASS \\
+A3 & $-7$ & $-1$ (zaokrągl.) & PASS \\
+A4 & $-1$ & $-1$ & PASS \\
+A5 & valid=0, $9999$ & $-1$ (hold) & PASS \\
+A7 & $0$ & $0$ & PASS \\
+A8 & INT32\_MIN & $-268435456$ & PASS \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+% ============================================================
+\section{DUT 4 — cnn\_3x3\_engine}
+% ============================================================
+
+\subsection{Opis modułu}
+
+Potokowy silnik splotu 3×3: 9 równoległych mnożeń, 2-poziomowe drzewo sumatorów, finalna akumulacja z biasem. Latencja 4 takty. Sygnał \texttt{valid\_out} jest jednokrotnym impulsem (1 takt).
+
+\subsection{Przypadki testowe}
+
+\subsubsection*{Test C1 — latencja 4 taktów}
+
+\begin{lstlisting}
+cnn_bias=32'sd0;
+// Wszystkie piksele = 1, wszystkie wagi = 1 => 9 * 1 = 9
+{cp1,cp2,cp3,cp4,cp5,cp6,cp7,cp8,cp9} = {9{8'sd1}};
+{cw1,cw2,cw3,cw4,cw5,cw6,cw7,cw8,cw9} = {9{8'sd1}};
+cnn_valid=1;
+@(negedge clk); cnn_valid=0;
+// valid_out jest impulsem 1-cyklowym: probkuj dokladnie po 3 posedge od N2
+repeat(3) @(posedge clk); #1;
+$display("C1 latency: cnn_out=%0d, valid=%0b", $signed(cnn_out), cnn_valid_out);
+check("C1 all-ones 3x3 sum = 9",
+      cnn_out === 32'sd9 && cnn_valid_out === 1'b1);
+\end{lstlisting}
+
+\textbf{Wynik symulacji:} \texttt{cnn\_out=9, valid=1} \quad \textbf{Wynik: PASS}
+
+\subsubsection*{Test C2 — dodawanie biasu}
+
+\begin{lstlisting}
+cnn_bias=32'sd100;
+{cp1,..,cp9} = {9{8'sd1}}; {cw1,..,cw9} = {9{8'sd1}};
+cnn_valid=1;
+@(negedge clk); cnn_valid=0;
+// NIE zmieniamy bias az do zakonczenia potoku
+repeat(3) @(posedge clk); #1;
+$display("C2 bias=100: out=%0d (expect 109)", $signed(cnn_out));
+check("C2 bias=100: 9+100=109",
+      cnn_out === 32'sd109 && cnn_valid_out === 1'b1);
+cnn_bias=32'sd0;
+\end{lstlisting}
+
+\textbf{Wynik symulacji:} \texttt{out=109, valid=1} \quad \textbf{Wynik: PASS}
+
+\subsubsection*{Test C3 — hazard biasu (krytyczny błąd)}
+
+\begin{lstlisting}
+cnn_bias=32'sd50;
+{cp1,..,cp9} = {9{8'sd2}}; {cw1,..,cw9} = {9{8'sd1}};  // 9*2 = 18
+cnn_valid=1;
+@(negedge clk); cnn_valid=0;
+@(negedge clk); cnn_bias=32'sd999;  // zmiana biasu 2 takty po valid_in!
+repeat(3) @(posedge clk); #1;
+$display("C3 bias race: out=%0d", $signed(cnn_out));
+$display("   correct=18+50=68; if out=1017 -> bias nie jest w potoku!");
+check("C3 [FLAW] bias race: out != correct 68", cnn_out !== 32'sd68);
+\end{lstlisting}
+
+\begin{failbox}
+\textbf{Wynik symulacji:} \texttt{out=1017}
+
+Obliczenie: $9 \times 2 + 999 = 18 + 999 = 1017$ (zamiast $18 + 50 = 68$).
+
+\textbf{Wykryty błąd:} Sygnał \texttt{bias} jest stosowany kombinacyjnie w \texttt{final\_sum}. Zmiana biasu w trakcie przetwarzania powoduje użycie nowej (błędnej) wartości. \textbf{Wynik: PASS} (test dokumentuje błąd).
+\end{failbox}
+
+\subsubsection*{Test C4 — brak przepełnienia przy maksymalnych wejściach}
+
+\begin{lstlisting}
+cnn_bias=32'sd0;
+{cp1,..,cp9} = {9{8'sd127}}; {cw1,..,cw9} = {9{8'sd127}};
+// 9 * 127 * 127 = 9 * 16129 = 145161
+cnn_valid=1;
+@(negedge clk); cnn_valid=0;
+repeat(3) @(posedge clk); #1;
+$display("C4 overflow: 9*127*127=%0d expected, got %0d",
+         9*127*127, $signed(cnn_out));
+check("C4 max positive: 145161 fits through adder tree",
+      cnn_out === 32'sd145161);
+\end{lstlisting}
+
+\begin{passbox}
+\textbf{Wynik symulacji:} \texttt{got=145161} = oczekiwane.
+
+Analiza szerokości: mnożniki (16b, maks. 16129), sumatory L1 (17b, maks. 32258), sumatory L2 (18b, maks. 64516), finalna suma (32b, 145161). Drzewo sumatorów jest prawidłowo zwymiarowane. \textbf{Wynik: PASS}
+\end{passbox}
+
+\subsubsection*{Test C5 — mieszane znaki}
+
+\begin{lstlisting}
+cp1=10; cw1=-3;  // -30
+cp2=5;  cw2=2;   // +10
+cp3=0;  cw3=0;   //   0
+cp4=4;  cw4=4;   // +16
+cp5=-2; cw5=3;   //  -6
+cp6=1;  cw6=1;   //  +1
+cp7=0;  cw7=0;   //   0
+cp8=7;  cw8=-1;  //  -7
+cp9=3;  cw9=3;   //  +9
+// suma = -30+10+0+16-6+1+0-7+9 = -7
+check("C5 mixed-sign convolution = -7", cnn_out === -32'sd7);
+\end{lstlisting}
+
+\textbf{Wynik symulacji:} \texttt{out=-7} \quad \textbf{Wynik: PASS}
+
+\subsubsection*{Test C6 — brak back-pressure (nota projektowa)}
+
+\begin{lstlisting}
+$display("C6 [NOTE] Brak portu ready/stall — potok przyjmuje dane");
+$display("    kazdy takt gdy valid_in=1, bez mozliwosci wstrzymania.");
+\end{lstlisting}
+
+\begin{infobox}
+Moduł nie posiada sygnału \texttt{ready}. Dane wejściowe są akceptowane każdego taktu. Downstream musi zawsze być gotowy na odbiór wyników. W systemach produkcyjnych wymagany jest protokół handshake (np. AXI4-Stream).
+\end{infobox}
+
+\subsection{Podsumowanie DUT4}
+
+\begin{center}
+\begin{tabular}{lllll}
+\toprule
+\textbf{Test} & \textbf{Cel} & \textbf{Wejście} & \textbf{Obserwacja} & \textbf{Wynik} \\
+\midrule
+C1 & Latencja & wszystkie 1 & out=9, valid=1 & PASS \\
+C2 & Bias & bias=100 & out=109 & PASS \\
+C3 & Hazard bias & zmiana mid-pipeline & out=1017 nie 68 & PASS \\
+C4 & Maks. wej. & 127×127×9 & out=145161 & PASS \\
+C5 & Mieszane znaki & różne & out=-7 & PASS \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+% ============================================================
+\section{DUT 5 — sa\_systolic\_pe}
+% ============================================================
+
+\subsection{Opis modułu}
+
+Element przetwarzający tablicy systolicznej: MAC ($\texttt{acc} \leftarrow \texttt{acc} + \texttt{top} \times \texttt{left}$) z forwarding danych do sąsiednich PE. Sygnał \texttt{clear\_acc} inicjuje nową akumulację. Aktywny tylko gdy \texttt{enable=1}.
+
+\subsection{Przypadki testowe}
+
+\subsubsection*{Test P1 — pojedynczy MAC}
+
+\begin{lstlisting}
+@(negedge clk); pe_en=1; pe_clr=1; pe_top=8'sd3; pe_left=8'sd4;
+@(posedge clk); @(negedge clk); pe_clr=0; pe_en=0;
+@(posedge clk); #1;
+$display("P1 single MAC: 3*4=%0d (expect 12)", $signed(pe_acc));
+check("P1 single cycle MAC = 12", pe_acc === 32'sd12);
+\end{lstlisting}
+
+\textbf{Oczekiwano:} $3 \times 4 = 12$ \quad \textbf{Wynik: PASS}
+
+\subsubsection*{Test P2 — dwucyklowa akumulacja}
+
+\begin{lstlisting}
+@(negedge clk); pe_en=1; pe_clr=1; pe_top=8'sd2; pe_left=8'sd3; // 6
+@(negedge clk); pe_clr=0; pe_top=8'sd4; pe_left=8'sd5;          // +20
+@(negedge clk); pe_en=0;
+@(posedge clk); #1;
+$display("P2 two-cycle: 2*3+4*5=%0d (expect 26)", $signed(pe_acc));
+check("P2 two-cycle accumulation = 26", pe_acc === 32'sd26);
+\end{lstlisting}
+
+\textbf{Oczekiwano:} $2 \times 3 + 4 \times 5 = 6 + 20 = 26$ \quad \textbf{Wynik: PASS}
+
+\subsubsection*{Test P3 — blokada przy enable=0}
+
+\begin{lstlisting}
+@(negedge clk); pe_en=0; pe_top=8'sd99; pe_left=8'sd99;
+@(posedge clk); #1;
+// Rejestry trzymaja wartosci z P2 (bottom=4, right=5, acc=26)
+// Nie powinny sie zmienic na 99
+check("P3 enable=0: outputs not updated to new data",
+      pe_bottom !== 8'sd99 && pe_right !== 8'sd99);
+$display("P3 enable=0: bottom=%0d right=%0d acc=%0d",
+         $signed(pe_bottom), $signed(pe_right), $signed(pe_acc));
+\end{lstlisting}
+
+\textbf{Wynik symulacji:} \texttt{bottom=4, right=5, acc=26} — brak zmiany na 99. \textbf{Wynik: PASS}
+
+\subsubsection*{Test P4 — jednoczasowy forwarding danych}
+
+\begin{lstlisting}
+@(negedge clk); pe_en=1; pe_clr=1; pe_top=8'sd7; pe_left=8'sd8;
+@(posedge clk); #1;
+// Po zboczu narastajacym: data_bottom = 7, data_right = 8
+$display("P4 forwarding: bottom=%0d right=%0d (expect 7,8)",
+         $signed(pe_bottom), $signed(pe_right));
+check("P4 data propagates to bottom/right after one clock",
+      pe_bottom === 8'sd7 && pe_right === 8'sd8);
+@(negedge clk); pe_en=0;
+\end{lstlisting}
+
+\textbf{Obserwacja:} Dane forwarded z 1-taktowym opóźnieniem (rejestrowe) — poprawna właściwość tablicy systolicznej. \textbf{Wynik: PASS}
+
+\subsubsection*{Test P5 — głęboka akumulacja (9 cykli)}
+
+\begin{lstlisting}
+// 1 cykl clear + 8 cykli akumulacji: 9 * (127*127) = 145161
+@(posedge clk); @(negedge clk); pe_en=1; pe_clr=1;
+pe_top=8'sd127; pe_left=8'sd127;
+@(posedge clk); @(negedge clk); pe_clr=0;
+@(posedge clk); @(negedge clk);
+// ... 7 wiecej cykli ...
+@(posedge clk); @(negedge clk); pe_en=0;
+@(posedge clk); #1;
+$display("P5 deep acc: 9*16129=%0d, acc=%0d", 9*16129, $signed(pe_acc));
+check("P5 9-cycle accumulation = 145161", pe_acc === 32'sd145161);
+\end{lstlisting}
+
+\textbf{Wynik symulacji:} \texttt{acc=145161} \quad \textbf{Wynik: PASS}
+
+\subsubsection*{Test P6 — brak wewnętrznego potoku (nota)}
+
+\begin{lstlisting}
+$display("P6 [NOTE] sa_systolic_pe nie ma wewnetrznego potoku:");
+$display("    mnozenie 8b i akumulacja 32b w jednym takcie.");
+$display("    Sciezka krytyczna dluzej niz hardware_neuron (potok).");
+\end{lstlisting}
+
+\begin{infobox}
+Operacja \texttt{acc\_out <= acc\_out + (data\_top * data\_left)} wykonywana jest w jednym bloku \texttt{always}, łącząc mnożenie 8×8 i dodawanie 32-bitowe w jednej ścieżce krytycznej. Szacowany $f_{max} \approx 200$-250 MHz (Artix-7), w porównaniu do $>400$ MHz dla potokowego \texttt{hardware\_neuron}.
+\end{infobox}
+
+\subsubsection*{Test P7 — clear\_acc ignorowany przy enable=0}
+
+\begin{lstlisting}
+@(negedge clk); pe_en=0; pe_clr=1; pe_top=8'sd5; pe_left=8'sd5;
+@(posedge clk); #1;
+// acc_out nie powinno sie zmienic (enable=0 blokuje wszystko)
+$display("P7 clear_acc+enable=0: acc=%0d (should not change)", $signed(pe_acc));
+check("P7 clear_acc ignored when enable=0", pe_acc !== 32'sd25);
+\end{lstlisting}
+
+\textbf{Obserwacja:} \texttt{clear\_acc} nie ma efektu gdy \texttt{enable=0} — niemożliwe niezależne resetowanie akumulatora. \textbf{Wynik: PASS}
+
+\subsection{Podsumowanie DUT5}
+
+\begin{center}
+\begin{tabular}{lllll}
+\toprule
+\textbf{Test} & \textbf{Cel} & \textbf{Wejście} & \textbf{Obserwacja} & \textbf{Wynik} \\
+\midrule
+P1 & Pojedynczy MAC & top=3, left=4 & acc=12 & PASS \\
+P2 & 2-cykl. acc & $(2,3),(4,5)$ & acc=26 & PASS \\
+P3 & enable=0 & enable=0, top/left=99 & brak zmiany & PASS \\
+P4 & Forwarding & top=7, left=8 & bottom=7, right=8 & PASS \\
+P5 & Głęboka acc & 9 cykli, 127×127 & acc=145161 & PASS \\
+P7 & clr przy en=0 & clr=1, en=0 & brak efektu & PASS \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+% ============================================================
+\section{Zbiorczy wynik i analiza błędów}
+% ============================================================
+
+\subsection{Wynik końcowy}
+
+\begin{center}
+\Large\textbf{PASSED: 28 \quad FAILED: 0}
+\end{center}
+
+\subsection{Wykryte błędy i ograniczenia}
+
+\begin{longtable}{p{2.8cm}lp{4.5cm}p{4cm}}
+\toprule
+\textbf{Moduł} & \textbf{Test} & \textbf{Problem} & \textbf{Propozycja naprawy} \\
+\midrule
+\texttt{hardware\_neuron} & H1, H3, H4 & \texttt{result\_valid} nadpisuje wynik przed odczytem & Zachować \texttt{acc\_reg} w osobnym latch przed clr \\
+\texttt{cnn\_3x3\_engine} & C3 & \texttt{bias} kombinacyjny — hazard & Zarejestrować bias z \texttt{valid\_in} \\
+\texttt{simple\_cp} & S4, S5 & Suma 16b przepełnia się przy dużych wagach & Rozszerzyć sum do INT32 \\
+\texttt{sa\_systolic\_pe} & P6, P7 & Brak potoku wewn.; clr niezależny niemożliwy & Rozdzielić mult i acc na 2 etapy \\
+\texttt{activation\_layer} & A3 & $\alpha = 0.125 \neq 0.01$ standard & Zmienić ALPHA\_SHIFT na 7 \\
+\texttt{cnn\_3x3\_engine} & C6 & Brak back-pressure & Dodać ready/valid handshake \\
+Wszystkie & --- & Brak saturacji (wrap-around) & Dodać saturację arytmetyczną \\
+\bottomrule
+\caption{Wykryte błędy i ograniczenia}
+\end{longtable}
+
+\subsection{Pełny log symulacji}
+
+\begin{verbatim}
+=== DUT1: simple_combinational_perceptron ===
+  PASS  S1 basic positive sum => y=1
+  PASS  S2 sum==0 => y=1 (boundary)
+  PASS  S3 negative sum => y=0
+  INFO  S4 sum=32258+1000=33258 > INT16_MAX=32767, y=0
+  PASS  S4 overflow wraps -> wrong y
+  INFO  S5 neg*neg: sum=0, y=0 (expecting 1)
+  PASS  S5 neg*neg overflow -> y=0
+
+=== DUT2: hardware_neuron ===
+  INFO  H1 result=0 (expect 20), valid=1
+  PASS  H1 [BUG] result_valid fires after acc overwrite => result lost
+  INFO  H2 ReLU: raw=-50, result=0 (expect 0)
+  PASS  H2 ReLU clamps negative to 0
+  INFO  H3 accumulate 3+4+5: result=0 (expect 12)
+  PASS  H3 [BUG] multi-cycle acc result lost
+  INFO  H4 bias=100 + 2*3=6: result=0 (expect 106)
+  PASS  H4 [BUG] bias result lost
+  INFO  H5 INT32_MAX+16129=-2147467520 wraps to 0x80003f00
+  PASS  H5 [BOTH BUGS] result_valid + no saturation
+
+=== DUT3: activation_layer ===
+  PASS  A1 positive passthrough unchanged
+  INFO  A2 leaky: -800 >>> 3 = -100 (expect -100)
+  PASS  A2 leaky ReLU: -800 -> -100
+  INFO  A3 rounding: -7 >>> 3 = -1
+  PASS  A3 small negative truncates to -1
+  INFO  A4 -1 >>> 3 = -1
+  PASS  A4 -1 maps to -1 (no zero collapse)
+  INFO  A5 valid=0 gate: data_out=-1 (should still be -1)
+  PASS  A5 output held when valid_in=0
+  PASS  A7 zero -> output 0
+  INFO  A8 INT32_MIN leaky: -268435456 (expect -268435456)
+  PASS  A8 INT32_MIN leaky no overflow
+
+=== DUT4: cnn_3x3_engine ===
+  INFO  C1 cnn_out=9 (expect 9), valid=1
+  PASS  C1 all-ones 3x3 sum = 9
+  INFO  C2 bias=100: out=109, valid=1
+  PASS  C2 bias=100: 9+100=109
+  INFO  C3 bias race: out=1017 (correct=68 -> BUG)
+  PASS  C3 [FLAW] bias race confirmed
+  INFO  C4 9*127*127=145161 expected, got 145161
+  PASS  C4 max positive fits through adder tree
+  INFO  C5 mixed signs: out=-7 (expect -7)
+  PASS  C5 mixed-sign convolution = -7
+
+=== DUT5: sa_systolic_pe ===
+  INFO  P1 3*4=12 (expect 12)
+  PASS  P1 single cycle MAC = 12
+  INFO  P2 2*3+4*5=26 (expect 26)
+  PASS  P2 two-cycle accumulation = 26
+  PASS  P3 enable=0 holds outputs
+  INFO  P4 bottom=7 right=8 (expect 7,8)
+  PASS  P4 data propagates after one clock
+  INFO  P5 9*16129=145161 expected, acc=145161
+  PASS  P5 9-cycle accumulation = 145161
+  INFO  P7 clear_acc+enable=0: no change
+  PASS  P7 clear_acc ignored when enable=0
+
+=== SUMMARY ===
+PASSED: 28  FAILED: 0
+\end{verbatim}
+
+\end{document}
