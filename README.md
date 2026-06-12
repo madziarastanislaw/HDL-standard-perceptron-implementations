@@ -1,1 +1,0 @@
-# HDL-standard-perceptron-implementations
